@@ -1,4 +1,6 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -15,9 +17,11 @@ in a collection of wallets.
 -}
 module Cardano.Wallet.DB.Store.Wallets.Model
     ( DeltaTxWalletsHistory (..)
+    , DeltaWalletsMetaWithSubmissions (..)
     , TxWalletsHistory
-    , walletsLinkedTransactions
+    , embedConstrainedSubmissions
     , mkTransactionInfo
+    , walletsLinkedTransactions
     ) where
 
 import Prelude
@@ -35,11 +39,9 @@ import Cardano.Wallet.DB.Sqlite.Schema
 import Cardano.Wallet.DB.Sqlite.Types
     ( TxId (getTxId) )
 import Cardano.Wallet.DB.Store.Meta.Model
-    ( DeltaTxMetaHistory (..)
-    , ManipulateTxMetaHistory
-    , TxMetaHistory (..)
-    , mkTxMetaHistory
-    )
+    ( DeltaTxMetaHistory (..), TxMetaHistory (..), mkTxMetaHistory )
+import Cardano.Wallet.DB.Store.Submissions.Model
+    ( DeltaTxLocalSubmission (..), TxLocalSubmissionHistory (..) )
 import Cardano.Wallet.DB.Store.Transactions.Model
     ( Decoration (With)
     , TxHistory
@@ -56,7 +58,7 @@ import Cardano.Wallet.Primitive.Types.TokenMap
 import Cardano.Wallet.Primitive.Types.Tx
     ( TxMeta (..), TxOut (..) )
 import Data.Delta
-    ( Delta (..) )
+    ( Delta (..), Embedding' (..) )
 import Data.DeltaMap
     ( DeltaMap (Adjust, Insert) )
 import Data.Foldable
@@ -66,7 +68,7 @@ import Data.Function
 import Data.Functor
     ( (<&>) )
 import Data.Generics.Internal.VL
-    ( (^.) )
+    ( over, view, (^.) )
 import Data.Map.Strict
     ( Map )
 import Data.Quantity
@@ -78,6 +80,7 @@ import Fmt
 
 import qualified Cardano.Wallet.DB.Sqlite.Schema as DB
 import qualified Cardano.Wallet.DB.Store.Meta.Model as TxMetaStore
+import qualified Cardano.Wallet.DB.Store.Submissions.Model as TxSubmissions
 import qualified Cardano.Wallet.DB.Store.Transactions.Model as TxStore
 import qualified Cardano.Wallet.Primitive.Types as W
 import qualified Cardano.Wallet.Primitive.Types.Coin as WC
@@ -110,33 +113,36 @@ instance Delta DeltaTxWalletsHistory where
     apply (ExpandTxWalletsHistory wid cs) (txh,mtxmh) =
         ( apply (TxStore.Append $ mkTxHistory $ fst <$> cs) txh
         , mtxmh & case Map.lookup wid mtxmh of
-              Nothing -> apply @(DeltaMap _ DeltaTxMetaHistory)
-                  $ Insert wid
-                  $ mkTxMetaHistory wid cs
-              Just _ -> apply @(DeltaMap _ DeltaTxMetaHistory)
+              Nothing -> apply @(DeltaMap _ DeltaWalletsMetaWithSubmissions)
+                  $ Insert wid (mkTxMetaHistory wid cs, mempty)
+              Just _ -> apply @(DeltaMap _ DeltaWalletsMetaWithSubmissions)
                   $ Adjust wid
+                  $ ChangeMeta
                   $ TxMetaStore.Expand
                   $ mkTxMetaHistory wid cs)
     apply (ChangeTxMetaWalletsHistory wid change) (txh, mtxmh) =
         (txh, garbageCollectEmptyWallets
-            $ mtxmh & apply (Adjust wid $ Manipulate change))
+            $ mtxmh & apply (Adjust wid change)
+            )
     apply GarbageCollectTxWalletsHistory (TxHistoryF txh, mtxmh) =
         ( TxHistoryF $ Map.restrictKeys txh $ walletsLinkedTransactions mtxmh
         , mtxmh)
-    apply (RemoveWallet wid) (TxHistoryF txh, mtxmh) =
-        ( TxHistoryF txh, Map.delete wid mtxmh )
+    apply (RemoveWallet wid) (TxHistoryF txh,mtxmh) =
+        (TxHistoryF txh, Map.delete wid mtxmh)
 
--- necessary because database will not distinuish between
+-- necessary because database will not distinguish between
 -- a missing wallet in the map
 -- and a wallet that has no meta-transactions
-garbageCollectEmptyWallets :: Map k TxMetaHistory -> Map k TxMetaHistory
-garbageCollectEmptyWallets = Map.filter (not . null . relations)
+garbageCollectEmptyWallets :: Map k MetasAndSubmissionsHistory
+    -> Map k MetasAndSubmissionsHistory
+garbageCollectEmptyWallets = Map.filter (not . null . view #relations . fst)
 
-linkedTransactions :: TxMetaHistory -> Set TxId
-linkedTransactions (TxMetaHistory m) = Map.keysSet m
+linkedTransactions :: MetasAndSubmissionsHistory -> Set TxId
+linkedTransactions (TxMetaHistory m,_) = Map.keysSet m
 
-walletsLinkedTransactions :: Map W.WalletId TxMetaHistory -> Set TxId
-walletsLinkedTransactions = Set.unions . toList .  fmap linkedTransactions
+walletsLinkedTransactions
+    :: Map W.WalletId MetasAndSubmissionsHistory -> Set TxId
+walletsLinkedTransactions = Set.unions . toList . fmap linkedTransactions
 
 -- | compute a high level view of a transaction known as 'TransactionInfo'
 -- from a 'TxMeta' and a 'TxRelationF', nochecks are performed for consistency

@@ -1,9 +1,11 @@
 
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -17,38 +19,47 @@ Implementation of a store for 'TxWalletsHistory'
 module Cardano.Wallet.DB.Store.Wallets.Store
     ( mkStoreTxWalletsHistory
     , DeltaTxWalletsHistory(..)
-    , mkStoreWalletsMeta ) where
+    , mkStoreWalletsMeta
+    , mkStoreMetaWithSubmissions ) where
 
 import Prelude
 
 import Cardano.Wallet.DB.Sqlite.Schema
-    ( EntityField (TxMetaWalletId), TxMeta )
+    ( EntityField (..), LocalTxSubmission, TxMeta )
 import Cardano.Wallet.DB.Store.Meta.Model
-    ( DeltaTxMetaHistory (Manipulate), TxMetaHistory, mkTxMetaHistory )
+    ( TxMetaHistory, mkTxMetaHistory )
 import Cardano.Wallet.DB.Store.Meta.Store
     ( mkStoreMetaTransactions )
+import Cardano.Wallet.DB.Store.Submissions.Model
+    ( TxLocalSubmissionHistory )
+import Cardano.Wallet.DB.Store.Submissions.Store
+    ( mkStoreSubmissions )
 import Cardano.Wallet.DB.Store.Transactions.Model
     ( DeltaTxHistory (..), TxHistoryF (..), mkTxHistory )
 import Cardano.Wallet.DB.Store.Transactions.Store
     ( mkStoreTransactions )
 import Cardano.Wallet.DB.Store.Wallets.Model
-    ( DeltaTxWalletsHistory (..), walletsLinkedTransactions )
+    ( DeltaTxWalletsHistory (..)
+    , DeltaWalletsMetaWithSubmissions (..)
+    , embedConstrainedSubmissions
+    , walletsLinkedTransactions
+    )
 import Control.Applicative
     ( liftA2 )
-import Control.Exception
-    ( SomeException )
 import Control.Monad
     ( forM, forM_ )
 import Control.Monad.Except
     ( ExceptT (ExceptT), runExceptT )
 import Data.DBVar
-    ( Store (..) )
+    ( Store (..), embedStore', pairStores )
 import Data.DeltaMap
     ( DeltaMap (..) )
 import Data.Generics.Internal.VL
     ( view )
 import Data.List
     ( nub )
+import Data.Map.Strict
+    ( Map )
 import Database.Persist.Sql
     ( SqlPersistT, deleteWhere, entityVal, selectList, (==.) )
 
@@ -60,7 +71,7 @@ import qualified Data.Map.Strict as Map
 -- | Store for a map of 'DeltaTxMetaHistory' of multiple different wallets.
 mkStoreWalletsMeta :: Store
         (SqlPersistT IO)
-        (DeltaMap W.WalletId DeltaTxMetaHistory)
+        (DeltaMap W.WalletId DeltaWalletsMetaWithSubmissions)
 mkStoreWalletsMeta =
     Store
     { loadS = load
@@ -68,23 +79,41 @@ mkStoreWalletsMeta =
     , updateS = update
     }
   where
-    write reset = forM_ (Map.assocs reset) $ \(wid,metas)
-        -> writeS (mkStoreMetaTransactions wid) metas
-    update _ (Insert wid metas) =
+    write reset = forM_ (Map.assocs reset) $ \(wid,(metas,subs)) -> do
         writeS (mkStoreMetaTransactions wid) metas
+        writeS (mkStoreSubmissions wid) subs
+    update :: Map W.WalletId (TxMetaHistory, TxLocalSubmissionHistory)
+        -> DeltaMap W.WalletId DeltaWalletsMetaWithSubmissions
+        -> SqlPersistT IO ()
+    update _ (Insert wid (metas,subs)) = do
+        writeS (mkStoreMetaTransactions wid) metas
+        writeS (mkStoreSubmissions wid) subs
     update _ (Delete wid) = do
         deleteWhere [TxMetaWalletId ==. wid ]
-    update _ (Adjust wid da) =
+        deleteWhere [LocalTxSubmissionWalletId ==. wid ]
+    update _ (Adjust wid (ChangeMeta da)) = do
         updateS (mkStoreMetaTransactions wid) undefined da
-    load :: SqlPersistT
-            IO
-            (Either SomeException (Map.Map W.WalletId TxMetaHistory))
+    update _ (Adjust wid (ChangeSubmissions da)) = do
+        updateS (mkStoreSubmissions wid) undefined da
     load = do
         wids <- nub . fmap (view #txMetaWalletId . entityVal)
             <$> selectList @TxMeta [] []
+        subsWids <- nub . fmap (view #localTxSubmissionWalletId . entityVal)
+            <$> selectList @LocalTxSubmission [] []
         runExceptT $ do
-            xs <- forM wids $ ExceptT . loadS . mkStoreMetaTransactions
-            pure $ Map.fromList $ zip wids xs
+            metas <- fmap (Map.fromList . zip wids)
+                $ forM wids
+                $ ExceptT . loadS . mkStoreMetaTransactions
+            subs <- fmap (Map.fromList . zip subsWids)
+                $ forM subsWids
+                $ ExceptT . loadS . mkStoreSubmissions
+            pure
+                $ Map.mergeWithKey
+                    (\_ a b -> Just (a, b))
+                    (fmap (, mempty))
+                    (const mempty)
+                    metas
+                    subs
 
 -- | Store for 'DeltaTxWalletsHistory'.
 mkStoreTxWalletsHistory
@@ -92,34 +121,28 @@ mkStoreTxWalletsHistory
 mkStoreTxWalletsHistory =
     Store
     { loadS =
-            liftA2 (,) <$> loadS mkStoreTransactions <*> loadS mkStoreWalletsMeta
+          liftA2 (,) <$> loadS mkStoreTransactions <*> loadS mkStoreWalletsMeta
     , writeS = \(txHistory,txMetaHistory) -> do
-            writeS mkStoreTransactions txHistory
-            writeS mkStoreWalletsMeta txMetaHistory
+          writeS mkStoreTransactions txHistory
+          writeS mkStoreWalletsMeta txMetaHistory
     , updateS = \(txh@(TxHistoryF mtxh),mtxmh) -> \case
-            ExpandTxWalletsHistory wid cs -> do
-                updateS mkStoreTransactions txh
-                    $ TxStore.Append
-                    $ mkTxHistory
-                    $ fst <$> cs
-                -- see also Store.Wallets.Model.garbageCollectEmptyWallets
-                updateS mkStoreWalletsMeta mtxmh
-                    $ case Map.lookup wid mtxmh of
-                        Nothing ->
-                            Insert wid $ mkTxMetaHistory wid cs
-                        Just _ ->
-                            Adjust wid
-                            $ TxMetaStore.Expand
-                            $ mkTxMetaHistory wid cs
             ChangeTxMetaWalletsHistory wid change
                 -> updateS mkStoreWalletsMeta mtxmh
-                $ Adjust wid
-                $ Manipulate change
+                $ Adjust wid change
             GarbageCollectTxWalletsHistory -> mapM_
                 (updateS mkStoreTransactions txh . DeleteTx)
                 $ Map.keys
                 $ Map.withoutKeys mtxh
                 $ walletsLinkedTransactions mtxmh
             RemoveWallet wid -> updateS mkStoreWalletsMeta mtxmh $ Delete wid
+            ExpandTxWalletsHistory wid cs -> do
+                updateS mkStoreTransactions txh
+                    $ TxStore.Append
+                    $ mkTxHistory
+                    $ fst <$> cs
+                updateS mkStoreWalletsMeta mtxmh
+                    $ Adjust wid
+                    $ ChangeMeta
+                    $ TxMetaStore.Expand
+                    $ mkTxMetaHistory wid cs
     }
-
