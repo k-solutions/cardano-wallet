@@ -100,6 +100,8 @@ import Cardano.Wallet.DB.Store.Meta.Model
     , ManipulateTxMetaHistory (..)
     , TxMetaHistory (..)
     )
+import Cardano.Wallet.DB.Store.Submissions.Layer
+    ( pruneLocalTxSubmission, pruneLocalTxSubmissionNew )
 import Cardano.Wallet.DB.Store.Submissions.Model
     ( TxLocalSubmissionHistory (..) )
 import Cardano.Wallet.DB.Store.Transactions.Model
@@ -654,13 +656,22 @@ newDBLayerWith _cacheBehavior _tr ti SqliteContext{runQuery} = do
                         $ view #currentTip wcp
 
         , prune = \wid epochStability -> do
-            ExceptT $ do
+            tip <- ExceptT $ do
                 readCheckpoint_ wid >>= \case
                     Nothing -> pure $ Left $ ErrNoSuchWallet wid
                     Just cp -> Right <$> do
                         let tip = cp ^. #currentTip
                         pruneCheckpoints wid epochStability tip
-                        pruneLocalTxSubmission wid epochStability tip
+                        pure tip
+
+            lift $ modifyDBMaybe transactionsDBVar $ \txs ->
+                (Just
+                    $ ChangeTxMetaWalletsHistory wid
+                    $ ChangeSubmissions 
+                    $ pruneLocalTxSubmissionNew wid epochStability tip txs
+                , Right ()
+                )
+
             lift $ modifyDBMaybe transactionsDBVar $ \_ ->
                 (Just GarbageCollectTxWalletsHistory, ())
 
@@ -1078,22 +1089,7 @@ localTxSubmissionFromEntity
 localTxSubmissionFromEntity (sl0, LocalTxSubmission (TxId txid) _ sl tx) =
     W.LocalTxSubmissionStatus txid tx sl0 sl
 
--- | Remove transactions from the local submission pool once they can no longer
--- be rolled back.
-pruneLocalTxSubmission
-    :: W.WalletId
-    -> Quantity "block" Word32
-    -> W.BlockHeader
-    -> SqlPersistT IO ()
-pruneLocalTxSubmission wid (Quantity epochStability) tip =
-    rawExecute query params
-  where
-    query =
-        "DELETE FROM local_tx_submission " <>
-        "WHERE wallet_id=? AND tx_id IN " <>
-        "( SELECT tx_id FROM tx_meta WHERE tx_meta.block_height < ? )"
-    params = [toPersistValue wid, toPersistValue stableHeight]
-    stableHeight = getQuantity (tip ^. #blockHeight) - epochStability
+
 
 selectPrivateKey
     :: (MonadIO m, PersistPrivateKey (k 'RootK))
