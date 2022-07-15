@@ -1768,8 +1768,9 @@ spec = describe "NEW_SHELLEY_TRANSACTIONS" $ do
             (Link.balanceTransaction @'Shelley wa) Default toBalance'
 
         let (requiredAmt, largestFound) =
-                -- May need babbage specific values when address ADP-1909.
-                ("4.280100", "[2.853400]")
+                if _mainEra ctx >= ApiBabbage
+                then ("4.279050", "2.852700")
+                else ("4.280100", "[2.853400]")
         verify rTx'
             [ expectResponseCode HTTP.status403
             , expectErrorMessage errMsg403Collateral

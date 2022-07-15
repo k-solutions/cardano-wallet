@@ -146,6 +146,7 @@ import Cardano.Wallet.Primitive.Types.Tx
     , TxMetadata (..)
     , TxOut (..)
     , TxSize (..)
+    , cardanoTx
     , sealedTxFromCardano'
     , sealedTxFromCardanoBody
     , txOutAddCoin
@@ -575,7 +576,7 @@ newTransactionLayer networkId = TransactionLayer
                         selection delta
 
     , addVkWitnesses =
-        \_era stakeCreds policyCreds addressResolver inputResolver sealedTx ->
+        \stakeCreds policyCreds addressResolver inputResolver sealedTx ->
         do
             let acctResolver
                     :: RewardAccount -> Maybe (XPrv, Passphrase "encryption")

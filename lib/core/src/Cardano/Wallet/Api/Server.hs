@@ -504,6 +504,7 @@ import Cardano.Wallet.Primitive.Types.Tx
     , UnsignedTx (..)
     , cardanoTx
     , getSealedTxWitnesses
+    , ideallyNoLaterThan
     , txMintBurnMaxTokenQuantity
     , txOutCoin
     )
@@ -1995,13 +1996,13 @@ signTransaction
     -> Handler ApiSerialisedTransaction
 signTransaction ctx (ApiT wid) body = do
     let pwd = coerce $ body ^. #passphrase . #getApiT
-    let sealedTx = body ^. #transaction . #getApiT
+
+
     sealedTx' <- withWorkerCtx ctx wid liftE liftE $ \wrk -> liftHandler $ do
         let
             db = wrk ^. W.dbLayer @IO @s @k
             tl = wrk ^. W.transactionLayer @k
             nl = wrk ^. W.networkLayer
-        era <- liftIO $ NW.currentNodeEra nl
         db & \W.DBLayer{atomically, readCheckpoint} -> do
             W.withRootKey @_ @s wrk wid pwd ErrWitnessTxWithRootKey $ \rootK scheme -> do
                 cp <- mapExceptT atomically
@@ -2020,7 +2021,11 @@ signTransaction ctx (ApiT wid) body = do
                         -> Maybe (k 'AddressK XPrv, Passphrase "encryption")
                     keyLookup = isOwned (getState cp) (rootK, pwdP)
 
-                pure $ W.signTransaction tl era keyLookup (rootK, pwdP) utxo sealedTx
+
+                era <- liftIO $ NW.currentNodeEra nl
+                let sealedTx =
+                        ideallyNoLaterThan era $ body ^. #transaction . #getApiT
+                pure $ W.signTransaction tl keyLookup (rootK, pwdP) utxo sealedTx
 
     -- TODO: The body+witnesses seem redundant with the sealedTx already. What's
     -- the use-case for having them provided separately? In the end, the client
@@ -2607,8 +2612,10 @@ balanceTransaction
     -> ApiBalanceTransactionPostData n
     -> Handler ApiSerialisedTransaction
 balanceTransaction ctx genChange (ApiT wid) body = do
+    -- NOTE: Ideally we'd read @pp@ and @era@ atomically.
     pp <- liftIO $ NW.currentProtocolParameters nl
     -- TODO: This throws when still in the Byron era.
+    era <- liftIO $ NW.currentNodeEra nl
     let nodePParams = fromJust $ W.currentNodeProtocolParameters pp
     withWorkerCtx ctx wid liftE liftE $ \wrk -> do
         wallet <- liftHandler $ W.readWalletUTxOIndex @_ @s @k wrk wid
@@ -2638,6 +2645,7 @@ balanceTransaction ctx genChange (ApiT wid) body = do
         anyShelleyTx <- maybeToHandler ErrByronTxNotSupported
             . asAnyShelleyBasedEra
             . cardanoTx
+            . ideallyNoLaterThan era
             . getApiT $ body ^. #transaction
 
         res <- withShelleyBasedTx anyShelleyTx
@@ -2657,13 +2665,16 @@ decodeTransaction
         , IsOurs s Address
         , Typeable s
         , Typeable n
+        , HasNetworkLayer IO ctx
         )
     => ctx
     -> ApiT WalletId
     -> ApiSerialisedTransaction
     -> Handler (ApiDecodedTransaction n)
 decodeTransaction ctx (ApiT wid) (ApiSerialisedTransaction (ApiT sealed)) = do
-    let (decodedTx, toMint, toBurn, allCerts, interval) = decodeTx tl sealed
+    era <- liftIO $ NW.currentNodeEra nl
+    let (decodedTx, toMint, toBurn, allCerts, interval) =
+            decodeTx tl $ ideallyNoLaterThan era sealed
     let (Tx { txId
             , fee
             , resolvedInputs
@@ -2723,6 +2734,8 @@ decodeTransaction ctx (ApiT wid) (ApiSerialisedTransaction (ApiT sealed)) = do
         }
   where
     tl = ctx ^. W.transactionLayer @k
+    nl = ctx ^. W.networkLayer @IO
+
     policyIx = ApiT $ DerivationIndex $
         getIndex (minBound :: Index 'Hardened 'PolicyK)
 
@@ -2854,9 +2867,14 @@ submitTransaction
     -> ApiT WalletId
     -> ApiSerialisedTransaction
     -> Handler ApiTxId
-submitTransaction ctx apiw@(ApiT wid) apitx@(ApiSerialisedTransaction (ApiT sealedTx)) = do
+submitTransaction ctx apiw@(ApiT wid) apitx = do
     --TODO: revisit/possibly set proper ttls in ADP-1193
     ttl <- liftIO $ W.getTxExpiry ti Nothing
+    era <- liftIO $ NW.currentNodeEra nl
+
+    let sealedTx = ideallyNoLaterThan era . getApiT . (view #transaction) $ apitx
+    let (tx,_,_,_,_) = decodeTx tl sealedTx
+
     apiDecoded <- decodeTransaction @_ @s @k @n ctx apiw apitx
     when (isForeign apiDecoded) $
         liftHandler $ throwE ErrSubmitTransactionForeignWallet
@@ -2904,7 +2922,6 @@ submitTransaction ctx apiw@(ApiT wid) apitx@(ApiSerialisedTransaction (ApiT seal
             $ W.submitTx @_ @s @k wrk wid (tx, txMeta, sealedTx)
     return $ ApiTxId (apiDecoded ^. #id)
   where
-    (tx,_,_,_,_) = decodeTx tl sealedTx
     tl = ctx ^. W.transactionLayer @k
     ti :: TimeInterpreter (ExceptT PastHorizonException IO)
     nl = ctx ^. networkLayer
