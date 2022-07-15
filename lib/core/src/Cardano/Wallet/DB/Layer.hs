@@ -101,7 +101,7 @@ import Cardano.Wallet.DB.Store.Meta.Model
     , TxMetaHistory (..)
     )
 import Cardano.Wallet.DB.Store.Submissions.Layer
-    ( pruneLocalTxSubmission, pruneLocalTxSubmissionNew )
+    ( pruneLocalTxSubmissionNew )
 import Cardano.Wallet.DB.Store.Submissions.Model
     ( TxLocalSubmissionHistory (..) )
 import Cardano.Wallet.DB.Store.Transactions.Model
@@ -180,7 +180,7 @@ import Database.Persist.Sql
     , Update (..)
     , deleteWhere
     , insert_
-    , rawExecute
+
     , rawSql
     , repsert
     , selectFirst
@@ -805,7 +805,7 @@ newDBLayerWith _cacheBehavior _tr ti SqliteContext{runQuery} = do
                             $ ErrRemoveTxNoSuchWallet
                             $ ErrNoSuchWallet wid
                         )
-                    Just (TxMetaHistory metas)  ->
+                    Just (TxMetaHistory metas, _)  ->
                         case Map.lookup (TxId txId) metas of
                             Just DB.TxMeta{..} ->
                                 if txMetaStatus == W.InLedger then
@@ -815,6 +815,8 @@ newDBLayerWith _cacheBehavior _tr ti SqliteContext{runQuery} = do
                                 else
                                     let delta = Just
                                             $ ChangeTxMetaWalletsHistory wid
+                                            $ ChangeMeta
+                                            $ Manipulate
                                             $ PruneTxMetaHistory $ TxId txId
                                     in  (delta, Right ())
                             Nothing ->

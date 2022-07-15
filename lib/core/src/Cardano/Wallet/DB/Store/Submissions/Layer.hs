@@ -7,24 +7,29 @@ import Prelude
 
 import Cardano.Wallet.DB.Sqlite.Migration
     ()
+import Cardano.Wallet.DB.Sqlite.Schema
+    ( TxMeta (txMetaBlockHeight) )
+import Cardano.Wallet.DB.Sqlite.Types
+    ( TxId )
+import Cardano.Wallet.DB.Store.Meta.Model
+    ( TxMetaHistory (..) )
+import Cardano.Wallet.DB.Store.Submissions.Model
+    ( DeltaTxLocalSubmission (..) )
 import Cardano.Wallet.DB.Store.Wallets.Model
     ( TxWalletsHistory )
 import Data.Generics.Internal.VL.Lens
     ( (^.) )
+import Data.Maybe
+    ( fromMaybe )
 import Data.Quantity
     ( Quantity (..) )
 import Data.Word
     ( Word32 )
 import Database.Persist.Sql
     ( PersistField (toPersistValue), SqlPersistT, rawExecute )
-import Cardano.Wallet.DB.Sqlite.Types (TxId)
-import Cardano.Wallet.DB.Store.Meta.Model (TxMetaHistory(..))
-import Cardano.Wallet.DB.Sqlite.Schema (TxMeta(txMetaBlockHeight))
 
 import qualified Cardano.Wallet.Primitive.Types as W
 import qualified Data.Map.Strict as Map
-import Cardano.Wallet.DB.Store.Submissions.Model (TxLocalSubmissionHistory, DeltaTxLocalSubmission (..))
-import Data.Maybe (fromMaybe)
 
 -- | Remove transactions from the local submission pool once they can no longer
 -- be rolled back.
@@ -62,6 +67,6 @@ pruneLocalTxSubmissionNew
     -> TxWalletsHistory
     -> DeltaTxLocalSubmission
 pruneLocalTxSubmissionNew wid (Quantity epochStability) tip txs =
-    Prune $ fromMaybe [] $ selectOldTxIds wid stableHeight $ txs
+    Prune $ fromMaybe [] $ selectOldTxIds wid stableHeight txs
   where
     stableHeight = getQuantity (tip ^. #blockHeight) - epochStability
