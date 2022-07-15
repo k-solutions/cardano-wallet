@@ -89,24 +89,50 @@ import qualified Cardano.Wallet.Primitive.Types.Tx as WT
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 
--- | Verbs to change transactions store and wallet-indexed meta stores.
 data DeltaTxWalletsHistory
     = ExpandTxWalletsHistory W.WalletId [(WT.Tx, WT.TxMeta)]
-    -- ^ Add transactions and meta for a wallet.
-    | ChangeTxMetaWalletsHistory W.WalletId ManipulateTxMetaHistory
-    -- ^ Change metas for a wallet.
+    | ChangeTxMetaWalletsHistory W.WalletId DeltaWalletsMetaWithSubmissions
     | GarbageCollectTxWalletsHistory
-    -- ^ Delete all transactions that have no metas.
     | RemoveWallet W.WalletId
-    -- ^ Remove all metas of a wallet.
     deriving ( Show, Eq )
 
 instance Buildable DeltaTxWalletsHistory where
     build = build . show
 
--- | Transactions history is a shared transactions store together with
--- a set of meta-transactions stores indexed by wallet.
-type TxWalletsHistory = (TxHistory, Map W.WalletId TxMetaHistory)
+data DeltaWalletsMetaWithSubmissions
+    = ChangeMeta DeltaTxMetaHistory
+    | ChangeSubmissions DeltaTxLocalSubmission
+    deriving ( Show, Eq )
+
+type MetasAndSubmissionsHistory = (TxMetaHistory, TxLocalSubmissionHistory)
+
+constraintSubmissions
+    :: MetasAndSubmissionsHistory -> MetasAndSubmissionsHistory
+constraintSubmissions (metas,submissions) =
+    ( metas
+    , over #relations (\m -> Map.restrictKeys m
+                       $ Map.keysSet (metas ^. #relations)) submissions)
+
+instance Delta DeltaWalletsMetaWithSubmissions where
+    type Base DeltaWalletsMetaWithSubmissions = MetasAndSubmissionsHistory
+    apply (ChangeMeta cm) (metas,submissions) =
+        constraintSubmissions (apply cm metas, submissions)
+    apply (ChangeSubmissions cs) (metas,submissions) =
+        constraintSubmissions (metas, apply cs submissions)
+
+embedConstrainedSubmissions :: Embedding'
+        DeltaWalletsMetaWithSubmissions
+        (DeltaTxMetaHistory, DeltaTxLocalSubmission)
+embedConstrainedSubmissions =
+    Embedding'
+    { load = Right
+    , write = id
+    , update = \_ _ -> \case
+          ChangeMeta dtmh -> (dtmh, TxSubmissions.Expand mempty)
+          ChangeSubmissions dtls -> (TxMetaStore.Expand mempty, dtls)
+    }
+
+type TxWalletsHistory = (TxHistory, Map W.WalletId MetasAndSubmissionsHistory)
 
 instance Delta DeltaTxWalletsHistory where
     type Base DeltaTxWalletsHistory = TxWalletsHistory
@@ -144,9 +170,6 @@ walletsLinkedTransactions
     :: Map W.WalletId MetasAndSubmissionsHistory -> Set TxId
 walletsLinkedTransactions = Set.unions . toList . fmap linkedTransactions
 
--- | compute a high level view of a transaction known as 'TransactionInfo'
--- from a 'TxMeta' and a 'TxRelationF', nochecks are performed for consistency
--- betwee the 2 over 'TxId'.
 mkTransactionInfo :: Monad m
     => TimeInterpreter m
     -> W.BlockHeader

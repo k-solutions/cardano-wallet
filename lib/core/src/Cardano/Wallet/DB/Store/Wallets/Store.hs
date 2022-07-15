@@ -68,7 +68,15 @@ import qualified Cardano.Wallet.DB.Store.Transactions.Model as TxStore
 import qualified Cardano.Wallet.Primitive.Types as W
 import qualified Data.Map.Strict as Map
 
--- | Store for a map of 'DeltaTxMetaHistory' of multiple different wallets.
+mkStoreMetaWithSubmissions :: W.WalletId
+    -> Store (SqlPersistT IO) DeltaWalletsMetaWithSubmissions
+mkStoreMetaWithSubmissions wid =
+    embedStore' embedConstrainedSubmissions
+    $ pairStores
+        (mkStoreMetaTransactions wid)
+        (mkStoreSubmissions wid)
+
+-- | Store for 'WalletsMeta' of multiple different wallets.
 mkStoreWalletsMeta :: Store
         (SqlPersistT IO)
         (DeltaMap W.WalletId DeltaWalletsMetaWithSubmissions)
@@ -115,9 +123,7 @@ mkStoreWalletsMeta =
                     metas
                     subs
 
--- | Store for 'DeltaTxWalletsHistory'.
-mkStoreTxWalletsHistory
-    :: Store (SqlPersistT IO) DeltaTxWalletsHistory
+mkStoreTxWalletsHistory :: Store (SqlPersistT IO) DeltaTxWalletsHistory
 mkStoreTxWalletsHistory =
     Store
     { loadS =
